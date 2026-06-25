@@ -21,6 +21,16 @@ const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
 const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
+// How long the forwarding MCP child waits for the parent bridge to accept a
+// client tool call. The old 1500ms was too tight: under a busy run the parent
+// event loop can stall past it, the fetch aborts, and the child tells the agent
+// "Outer client callback unavailable" -- which the agent then echoes as prose.
+const callbackTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_CALLBACK_TIMEOUT_MS, 30 * 1000);
+// Grace window after a run captures a forwardable tool call during which late
+// forwarding callbacks for the same agent are still accepted. Closes the race
+// where the run tears down its capture handler before the MCP child's callback
+// lands, which would otherwise return accepted=false to the agent.
+const forwardedGraceMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_FORWARD_GRACE_MS, 10 * 1000);
 const defaultCwd = process.env.CURSOR_SDK_WORKING_DIRECTORY || process.cwd();
 const clientMcpServerName = "client";
 const clientMcpServerMode = "--client-mcp-server";
@@ -29,7 +39,9 @@ const clientToolCallbackPath = "/client-tool-call";
 const agentCache = new Map();
 const agentRunQueues = new Map();
 const activeClientToolCaptures = new Map();
+const recentlyForwardedCacheKeys = new Map();
 const forceNextRunAgentKeys = new Set();
+const inFlightSdkResponses = new Set();
 let server = null;
 
 if (isMainModule()) {
@@ -59,7 +71,12 @@ export {
   statusFromError,
   startServer,
   validateClientMcpToolCall,
-  toolCallFromDelta
+  toolCallFromDelta,
+  registerActiveClientToolCapture,
+  captureActiveClientToolCall,
+  markRecentlyForwarded,
+  inFlightSdkResponses,
+  failInFlightSdkResponses
 };
 
 function startServer() {
@@ -97,6 +114,14 @@ async function handleRequest(request, response) {
     writeJson(response, openAiError(new HttpError("Invalid bridge token", 401, "unauthorized")), 401);
     return;
   }
+
+  // Track this run's response so a fatal-error shutdown can fail it with a clean
+  // retryable error instead of dropping the socket (which the caller sees as the
+  // opaque "Network connection lost").
+  inFlightSdkResponses.add(response);
+  const untrack = () => inFlightSdkResponses.delete(response);
+  response.on("close", untrack);
+  response.on("finish", untrack);
 
   const body = await readJsonBody(request);
   const apiKey = requiredString(body.apiKey, "apiKey");
@@ -143,6 +168,9 @@ async function handleClientToolCallback(request, response) {
   const toolName = requiredString(body.toolName, "toolName");
   const args = isRecord(body.arguments) ? body.arguments : {};
   const accepted = await captureActiveClientToolCall(cacheKey, { type: toolName, args });
+  if (!accepted) {
+    console.warn(`Client tool callback not accepted (tool=${toolName}, no active/recent run for agent).`);
+  }
   writeJson(response, { ok: true, accepted });
 }
 
@@ -257,8 +285,15 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   const captureToolCall = async (toolCall, options = {}) => {
     if (capturedToolCall || !toolCall) return;
     const normalized = normalizeSDKToolCall(toolCall, input.clientTools);
-    if (!normalized || !isForwardableSDKToolCall(normalized, input.clientTools)) return;
+    if (!normalized) return;
+    // `trusted` calls come from the forwarding MCP child's HTTP callback, which
+    // fires only once the agent has fully formed the client tool call. Their
+    // payload is complete by construction, so skip the streaming-era
+    // completeness gate that can spuriously reject them (e.g. a read whose path
+    // arg the gate doesn't recognize) and derail the run into prose.
+    if (!options.trusted && !isForwardableSDKToolCall(normalized, input.clientTools)) return;
     capturedToolCall = normalized;
+    markRecentlyForwarded(cacheKey);
     if (onEvent) onEvent({ type: "tool_call", toolCall: capturedToolCall });
     cancelRequested = true;
     if (run) {
@@ -273,7 +308,7 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   };
 
   const unregisterCapture = registerActiveClientToolCapture(cacheKey, async (toolCall) => {
-    await captureToolCall(toolCall, { waitForCancel: false });
+    await captureToolCall(toolCall, { waitForCancel: false, trusted: true });
     return capturedToolCall !== null;
   });
   try {
@@ -391,12 +426,30 @@ function registerActiveClientToolCapture(cacheKey, handler) {
   };
 }
 
+function markRecentlyForwarded(cacheKey) {
+  const now = Date.now();
+  recentlyForwardedCacheKeys.set(cacheKey, now + forwardedGraceMs);
+  // Prune expired markers on write. Cache keys are unique per turn (the proxy
+  // sends a fresh session affinity each call), so without this the map grows
+  // unbounded.
+  for (const [key, expiry] of recentlyForwardedCacheKeys) {
+    if (expiry <= now) recentlyForwardedCacheKeys.delete(key);
+  }
+}
+
 async function captureActiveClientToolCall(cacheKey, toolCall) {
   const handlers = activeClientToolCaptures.get(cacheKey);
-  if (!handlers || handlers.size === 0) return false;
-  for (const handler of [...handlers]) {
-    if (await handler(toolCall)) return true;
+  if (handlers && handlers.size > 0) {
+    for (const handler of [...handlers]) {
+      if (await handler(toolCall)) return true;
+    }
   }
+  // No live handler accepted it, but if this agent just captured a forwardable
+  // tool call its run is already tearing down to hand that call to the outer
+  // client. A callback landing in that window is the same forwarding intent --
+  // accept it rather than telling the agent the callback was unavailable.
+  const graceExpiry = recentlyForwardedCacheKeys.get(cacheKey);
+  if (graceExpiry && graceExpiry > Date.now()) return true;
   return false;
 }
 
@@ -437,6 +490,7 @@ function clientForwardingMcpServers(clientTools = [], cacheKey = "") {
       env: {
         CURSOR_SDK_BRIDGE_CALLBACK_URL: `http://${host}:${port}${clientToolCallbackPath}`,
         CURSOR_SDK_BRIDGE_CALLBACK_TOKEN: bridgeToken,
+        CURSOR_SDK_BRIDGE_CALLBACK_TIMEOUT_MS: String(callbackTimeoutMs),
         CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: cacheKey,
         CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON: JSON.stringify(clientMcpToolDefinitions(clientTools))
       }
@@ -562,7 +616,7 @@ async function runClientForwardingMcpServer({
 async function notifyParentToolCall({ callbackUrl, callbackToken, callbackCacheKey, toolName, input }) {
   if (!callbackUrl || !callbackCacheKey) return true;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
+  const timer = setTimeout(() => controller.abort(), callbackTimeoutMs);
   try {
     const headers = { "Content-Type": "application/json" };
     if (callbackToken) headers.Authorization = `Bearer ${callbackToken}`;
@@ -594,6 +648,7 @@ const tools = ${tools};
 const callbackUrl = process.env.CURSOR_SDK_BRIDGE_CALLBACK_URL || "";
 const callbackToken = process.env.CURSOR_SDK_BRIDGE_CALLBACK_TOKEN || "";
 const callbackCacheKey = process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || "";
+const callbackTimeoutMs = Number(process.env.CURSOR_SDK_BRIDGE_CALLBACK_TIMEOUT_MS) || 30000;
 const validateClientMcpToolCall = ${validateClientMcpToolCall.toString()};
 const validateJsonSchemaValue = ${validateJsonSchemaValue.toString()};
 const canonicalJsonSchema = ${canonicalJsonSchema.toString()};
@@ -643,7 +698,7 @@ function sendError(id, message) {
 async function notifyParentToolCall(toolName, input) {
   if (!callbackUrl || !callbackCacheKey) return true;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
+  const timer = setTimeout(() => controller.abort(), callbackTimeoutMs);
   try {
     const headers = { "Content-Type": "application/json" };
     if (callbackToken) headers.Authorization = "Bearer " + callbackToken;
@@ -2085,28 +2140,30 @@ function writeNdjson(response, body) {
 }
 
 function installBridgeProcessHandlers() {
-  process.on("unhandledRejection", (reason) => {
-    if (isBenignCancellationError(reason) || isBenignPipeError(reason)) return;
-    if (isRetryableSDKRunError(reason)) {
-      console.warn("Ignored late retryable Cursor SDK upstream error.");
-      return;
-    }
-    console.error(reason);
-    closeAndExit(1);
-  });
-  process.on("uncaughtException", (error) => {
-    if (isBenignCancellationError(error) || isBenignPipeError(error)) return;
-    if (isRetryableSDKRunError(error)) {
-      console.warn("Ignored late retryable Cursor SDK upstream error.");
-      return;
-    }
-    console.error(error);
-    closeAndExit(1);
-  });
+  process.on("unhandledRejection", handleFatalBridgeError);
+  process.on("uncaughtException", handleFatalBridgeError);
+}
+
+// A fatal error (e.g. an upstream "unauthenticated" ConnectError from Cursor)
+// can't be recovered in-process: the SDK's auth/session is established once at
+// startup, so the only reliable fix is a fresh process. We do a CONTROLLED exit
+// -- fail in-flight runs with a clean retryable error, close cleanly, and let
+// the supervisor restart us, which re-authenticates from the API key.
+function handleFatalBridgeError(error) {
+  if (isBenignCancellationError(error) || isBenignPipeError(error)) return;
+  if (isRetryableSDKRunError(error)) {
+    console.warn("Ignored late retryable Cursor SDK upstream error.");
+    return;
+  }
+  console.error(
+    "Bridge exiting after fatal Cursor SDK error; supervisor will restart and re-authenticate."
+  );
+  console.error(error);
+  closeAndExit(1);
 }
 
 function isBenignCancellationError(error) {
-  return error?.name === "AbortError" || error?.code === "ABORT_ERR";
+  return error?.name === "AbortError" || error?.code === "ABORT_ERR" || error?.code === 1 || error?.rawMessage === "This operation was aborted" || (typeof error?.message === "string" && error.message.includes("This operation was aborted")); /* connect-canceled-benign */
 }
 
 function isBenignPipeError(error) {
@@ -2325,6 +2382,7 @@ function loadEnvFile(filePath) {
 }
 
 async function closeAndExit(code) {
+  failInFlightSdkResponses();
   for (const entry of agentCache.values()) {
     try {
       entry.agent.close();
@@ -2332,6 +2390,34 @@ async function closeAndExit(code) {
   }
   server?.close(() => process.exit(code));
   setTimeout(() => process.exit(code), 500).unref();
+}
+
+// Respond to any open /sdk runs with a clean, retryable error before we exit, so
+// the caller (composer-api -> proxy -> Claude Code) sees a proper 503 it can
+// retry against the restarted bridge instead of an abruptly dropped connection.
+function failInFlightSdkResponses() {
+  const err = new HttpError(
+    "Cursor SDK bridge restarting after a fatal upstream error.",
+    503,
+    "cursor_sdk_restarting"
+  );
+  err.isRetryable = true;
+  for (const response of [...inFlightSdkResponses]) {
+    inFlightSdkResponses.delete(response);
+    try {
+      if (response.writableEnded || response.destroyed) continue;
+      if (response.headersSent) {
+        // A streaming ndjson response already started; emit a terminal error
+        // event in the shape streamLocalAgent uses, then end the stream.
+        try {
+          response.write(`${JSON.stringify({ type: "error", error: openAiError(err).error })}\n`);
+        } catch {}
+        response.end();
+      } else {
+        writeJson(response, openAiError(err), 503);
+      }
+    } catch {}
+  }
 }
 
 function isMainModule() {

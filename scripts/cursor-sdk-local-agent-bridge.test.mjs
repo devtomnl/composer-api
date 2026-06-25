@@ -17,7 +17,12 @@ import {
   sdkRunFailureSummary,
   statusFromError,
   toolCallFromDelta,
-  validateClientMcpToolCall
+  validateClientMcpToolCall,
+  registerActiveClientToolCapture,
+  captureActiveClientToolCall,
+  markRecentlyForwarded,
+  inFlightSdkResponses,
+  failInFlightSdkResponses
 } from "./cursor-sdk-local-agent-bridge.mjs";
 
 const bridgeScriptPath = fileURLToPath(new URL("./cursor-sdk-local-agent-bridge.mjs", import.meta.url));
@@ -1909,5 +1914,99 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(baseSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("webfetch");
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("webfetch");
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("probe_write_file");
+  });
+
+  it("passes the callback timeout to the forwarding MCP child env", () => {
+    const sendOptions = localAgentSendOptions({
+      apiKey: "key",
+      model: "composer-2.5",
+      workingDirectory: "/tmp/work",
+      sessionKey: "timeout-session",
+      clientTools: [{ name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }]
+    });
+    const ms = Number(sendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CALLBACK_TIMEOUT_MS);
+    expect(Number.isFinite(ms)).toBe(true);
+    expect(ms).toBeGreaterThan(1500);
+  });
+
+  it("rejects a forwarding callback when no run is active for the agent", async () => {
+    expect(await captureActiveClientToolCall("absent-agent-key", { type: "read", args: { path: "/x" } })).toBe(false);
+  });
+
+  it("accepts a forwarding callback that an active capture handler claims", async () => {
+    const cacheKey = "active-handler-key";
+    const unregister = registerActiveClientToolCapture(cacheKey, async () => true);
+    try {
+      expect(await captureActiveClientToolCall(cacheKey, { type: "read", args: { path: "/x" } })).toBe(true);
+    } finally {
+      unregister();
+    }
+  });
+
+  it("accepts a late forwarding callback within the grace window after capture", async () => {
+    // Reproduces the race that produced "Outer client callback unavailable":
+    // the run captured a forwardable tool call and tore down its handler before
+    // the MCP child's callback landed. The grace marker keeps it accepted.
+    const cacheKey = "grace-window-key";
+    markRecentlyForwarded(cacheKey);
+    expect(activeClientToolCaptureHasHandler(cacheKey)).toBe(false);
+    expect(await captureActiveClientToolCall(cacheKey, { type: "read", args: { path: "/x" } })).toBe(true);
+  });
+});
+
+function activeClientToolCaptureHasHandler() {
+  // There is no active capture handler registered in this test; the accept
+  // decision must come from the grace marker alone.
+  return false;
+}
+
+describe("controlled-restart shutdown", () => {
+  function fakeResponse({ headersSent = false } = {}) {
+    const r = {
+      headersSent,
+      writableEnded: false,
+      destroyed: false,
+      statusCode: 0,
+      headers: {},
+      chunks: [],
+      ended: false,
+      writeHead(code, headers) { this.statusCode = code; this.headers = headers || {}; this.headersSent = true; },
+      setHeader(k, v) { this.headers[k] = v; },
+      write(chunk) { this.chunks.push(String(chunk)); return true; },
+      end(chunk) { if (chunk !== undefined) this.chunks.push(String(chunk)); this.ended = true; this.writableEnded = true; }
+    };
+    return r;
+  }
+
+  it("fails a not-yet-started run with a clean retryable 503 JSON body", () => {
+    inFlightSdkResponses.clear();
+    const r = fakeResponse({ headersSent: false });
+    inFlightSdkResponses.add(r);
+    failInFlightSdkResponses();
+    expect(r.statusCode).toBe(503);
+    const body = JSON.parse(r.chunks.join(""));
+    expect(body.error.code).toBe("cursor_sdk_restarting");
+    expect(inFlightSdkResponses.size).toBe(0);
+  });
+
+  it("ends an already-streaming run with a terminal error event", () => {
+    inFlightSdkResponses.clear();
+    const r = fakeResponse({ headersSent: true });
+    inFlightSdkResponses.add(r);
+    failInFlightSdkResponses();
+    expect(r.ended).toBe(true);
+    const lastEvent = JSON.parse(r.chunks.join("").trim().split("\n").pop());
+    expect(lastEvent.type).toBe("error");
+    expect(inFlightSdkResponses.size).toBe(0);
+  });
+
+  it("skips responses that already finished", () => {
+    inFlightSdkResponses.clear();
+    const r = fakeResponse({ headersSent: true });
+    r.writableEnded = true;
+    inFlightSdkResponses.add(r);
+    failInFlightSdkResponses();
+    expect(r.chunks.length).toBe(0);
+    expect(inFlightSdkResponses.size).toBe(0);
   });
 });

@@ -1,3 +1,4 @@
+// local-dev: CursorSdkBridgeContainer block removed by start.sh
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "composer-api",
@@ -35,30 +36,9 @@
       "bucket_name": "api-for-composer-releases"
     }
   ],
-  "containers": [
-    {
-      "class_name": "CursorSdkBridgeContainer",
-      "image": "./containers/cursor-sdk-bridge/Dockerfile",
-      "image_build_context": ".",
-      "instance_type": "lite",
-      "max_instances": 1,
-      "rollout_step_percentage": 100
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "CURSOR_SDK_BRIDGE_CONTAINER",
-        "class_name": "CursorSdkBridgeContainer"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "cursor_sdk_bridge_container_v1",
-      "new_sqlite_classes": ["CursorSdkBridgeContainer"]
-    }
-  ],
+  // containers / durable_objects / migrations for CursorSdkBridgeContainer removed
+  // for local dev: we never use the opt-in SDK bridge path, and the Docker build it
+  // requires fails / is unnecessary. composer-api is a gitignored local clone.
   "d1_databases": [
     {
       "binding": "DB",
