@@ -18,7 +18,7 @@ const port = parseInteger(process.env.CURSOR_SDK_BRIDGE_PORT, 8792);
 const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
 const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
-const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
+const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 300 * 1000);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
 // How long the forwarding MCP child waits for the parent bridge to accept a
@@ -31,6 +31,11 @@ const callbackTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_CALLBACK_TI
 // where the run tears down its capture handler before the MCP child's callback
 // lands, which would otherwise return accepted=false to the agent.
 const forwardedGraceMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_FORWARD_GRACE_MS, 10 * 1000);
+// Treat a completed-but-empty upstream run (no text, no tool call) as a
+// retryable failure so the wedged cached agent is evicted and a fresh session
+// is created on retry. Default on; set to "false" to restore the old behavior
+// of silently returning an empty completion.
+const retryOnEmpty = process.env.CURSOR_SDK_BRIDGE_RETRY_ON_EMPTY !== "false";
 const defaultCwd = process.env.CURSOR_SDK_WORKING_DIRECTORY || process.cwd();
 const clientMcpServerName = "client";
 const clientMcpServerMode = "--client-mcp-server";
@@ -76,7 +81,11 @@ export {
   captureActiveClientToolCall,
   markRecentlyForwarded,
   inFlightSdkResponses,
-  failInFlightSdkResponses
+  failInFlightSdkResponses,
+  runLocalAgentBody,
+  agentCache,
+  agentCacheKey,
+  evictAgent
 };
 
 function startServer() {
@@ -281,6 +290,8 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   let capturedToolCall = null;
   let cancelRequested = false;
   let text = "";
+  const streamEventTypes = new Set();
+  let lastDiagnosticEvent = null;
 
   const captureToolCall = async (toolCall, options = {}) => {
     if (capturedToolCall || !toolCall) return;
@@ -333,6 +344,7 @@ async function runLocalAgentBody(input, onRun, onEvent) {
 
     if (!capturedToolCall) {
       for await (const event of run.stream()) {
+        streamEventTypes.add(event?.type);
         if (event.type === "assistant") {
           for (const block of event.message?.content ?? []) {
             if (block?.type === "text" && typeof block.text === "string") {
@@ -347,6 +359,10 @@ async function runLocalAgentBody(input, onRun, onEvent) {
           await captureToolCall({ type: event.name, args: event.args }, { waitForCancel: false });
           if (capturedToolCall) break;
         }
+        // run.wait() returns a detail-free result on failure, so an error/result
+        // event in the stream is the only window into *why* a run fails. Hold the
+        // last one so sdkRunFailureError can surface it.
+        if (isDiagnosticStreamEvent(event)) lastDiagnosticEvent = event;
       }
     }
   } catch (error) {
@@ -371,11 +387,26 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   const result = await run.wait();
   if (result.status === "error") {
     if (agentEntry) evictAgent(agentEntry.cacheKey, agentEntry.agent);
-    throw sdkRunFailureError(result);
+    throw sdkRunFailureError(result, { streamEventTypes, diagnosticEvent: lastDiagnosticEvent, run });
   }
   if (!text && typeof result.result === "string") text = result.result;
+  const finalText = stripFinalMarker(text);
+  if (retryOnEmpty && !finalText) {
+    // Completed without error, no captured tool call, and nothing usable to
+    // return. The cached agent session is wedged and will keep returning empty
+    // on every reuse, so evict it and throw a retryable error to force a fresh
+    // session. Mirrors the error-status branch above plus sdkRunFailureError's
+    // observability warn.
+    if (agentEntry) evictAgent(agentEntry.cacheKey, agentEntry.agent);
+    const error = new HttpError("Cursor SDK run returned an empty completion.", 503, "cursor_sdk_empty");
+    error.isRetryable = true;
+    console.warn(
+      `Cursor SDK run returned an empty completion; evicting agent and retrying. raw=${describeSdkResult(result)}`
+    );
+    throw error;
+  }
   return {
-    text: stripFinalMarker(text),
+    text: finalText,
     toolCalls: [],
     agentID: agentEntry?.agent.agentId || "",
     runID: run.id,
@@ -2190,8 +2221,12 @@ function isRetryableSDKRunError(error) {
     );
 }
 
-function sdkRunFailureError(result) {
-  const summary = sdkRunFailureSummary(result);
+function sdkRunFailureError(result, diagnostics = {}) {
+  // A failing run's stream often carries the real reason in an error/result
+  // event even though run.wait()'s result is detail-free. Fold that event into
+  // the summary source so the surfaced message/code/retryability reflect it.
+  const diagnosticEvent = diagnostics.diagnosticEvent;
+  const summary = sdkRunFailureSummary(diagnosticEvent ? { ...result, error: diagnosticEvent } : result);
   const error = new HttpError(
     summary.message || "Cursor SDK run failed",
     summary.retryable ? 503 : 502,
@@ -2200,8 +2235,87 @@ function sdkRunFailureError(result) {
   error.rawMessage = summary.message;
   error.isRetryable = summary.retryable;
   error.cause = summary;
-  console.warn(`Cursor SDK run returned error status${summary.code ? ` (${summary.code})` : ""}.`);
+  // Dump the raw SDK result plus the stream-event diagnostics. Without this the
+  // error is a black box: run.wait() returns an error status with no
+  // message/code, so this is the only window into what actually failed (e.g.
+  // payload too large, tool schema rejected, upstream 4xx).
+  const eventTypes = diagnostics.streamEventTypes ? [...diagnostics.streamEventTypes].filter(Boolean) : [];
+  const eventNote = eventTypes.length ? ` events=[${eventTypes.join(",")}]` : "";
+  const diagNote = diagnosticEvent ? ` diag=${describeSdkResult(diagnosticEvent)}` : "";
+  const runNote = diagnostics.run ? ` run=${describeRunForLog(diagnostics.run)}` : "";
+  console.warn(
+    `Cursor SDK run returned error status${summary.code ? ` (${summary.code})` : ""}. raw=${describeSdkResult(result)}${eventNote}${diagNote}${runNote}`
+  );
   return error;
+}
+
+// True when a stream event looks like it carries failure detail (an error event,
+// or a terminal result/system event whose status is "error"). Used to retain the
+// most informative event for diagnostics when a run fails.
+function isDiagnosticStreamEvent(event) {
+  if (!isRecord(event)) return false;
+  const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
+  if (type.includes("error")) return true;
+  if (event.error || event.message || event.rawMessage) return true;
+  const status = typeof event.status === "string" ? event.status.toLowerCase() : "";
+  return status === "error" || status === "failed";
+}
+
+// Probe an SDK run object for where it stashes the failure reason. run.wait()'s
+// result is detail-free and the stream yields no events, so the cause (if the
+// SDK keeps one) must live on the run itself -- possibly behind getters that
+// JSON.stringify won't see. Enumerate own keys plus a list of likely fields.
+function describeRunForLog(run) {
+  if (!isRecord(run)) return String(run);
+  const candidates = [
+    "error", "lastError", "failure", "failureReason", "reason", "message",
+    "rawMessage", "status", "statusText", "code", "result", "errors",
+    "messages", "events", "abortReason", "cancelReason",
+    // SDK-internal fields seen on the run object; the usage/limit reason (the
+    // "You're out of usage" text cursor-agent shows) may live in one of these.
+    "_result", "currentStatus", "cancellationState", "eventBuffer", "store"
+  ];
+  const probe = {};
+  try {
+    probe._ownKeys = Object.keys(run);
+  } catch {}
+  for (const key of candidates) {
+    try {
+      const value = run[key];
+      if (value === undefined || typeof value === "function") continue;
+      probe[key] = value;
+    } catch (error) {
+      probe[key] = `[getter threw: ${error?.message || error}]`;
+    }
+  }
+  return describeSdkResult(probe, 6000);
+}
+
+// Safe, depth-tolerant serializer for an SDK run result/error so it can be
+// logged. Handles circular refs, Errors, BigInt and functions, and truncates so
+// a huge payload can't flood the log.
+function describeSdkResult(result, maxLen = 2000) {
+  if (result === undefined) return "undefined";
+  if (result === null) return "null";
+  try {
+    const seen = new WeakSet();
+    const json = JSON.stringify(result, (_key, value) => {
+      if (typeof value === "bigint") return `${value}n`;
+      if (typeof value === "function") return `[fn ${value.name || "anonymous"}]`;
+      if (value instanceof Error) {
+        return { name: value.name, message: value.message, code: value.code, stack: value.stack };
+      }
+      if (value && typeof value === "object") {
+        if (seen.has(value)) return "[circular]";
+        seen.add(value);
+      }
+      return value;
+    });
+    if (json === undefined) return String(result);
+    return json.length > maxLen ? `${json.slice(0, maxLen)}... [truncated ${json.length - maxLen} chars]` : json;
+  } catch (error) {
+    return `[unserializable result: ${error?.message || error}]`;
+  }
 }
 
 function sdkRunFailureSummary(result) {

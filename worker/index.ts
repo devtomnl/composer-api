@@ -593,6 +593,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
     workingDirectory: input.prepared.toolContext?.workingDirectory,
     clientTools: input.prepared.tools,
     requiresLocalTool: input.prepared.requiresLocalTool,
+    streaming: input.prepared.stream,
     allowToolCall: (toolCall) => {
       if (!input.prepared.tools.length) return "No client tool inventory was available for this request.";
       const toolCalls = toOpenAiToolCalls({
@@ -750,6 +751,7 @@ async function handleOpenCodeSdkChatRoute(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
+      streaming: prepared.stream,
       allowToolCall: (toolCall) => {
         const toolCalls = toOpenAiToolCalls({
           toolCalls: [toolCall],

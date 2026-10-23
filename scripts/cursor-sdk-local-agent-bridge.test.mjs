@@ -22,7 +22,10 @@ import {
   captureActiveClientToolCall,
   markRecentlyForwarded,
   inFlightSdkResponses,
-  failInFlightSdkResponses
+  failInFlightSdkResponses,
+  runLocalAgentBody,
+  agentCache,
+  agentCacheKey
 } from "./cursor-sdk-local-agent-bridge.mjs";
 
 const bridgeScriptPath = fileURLToPath(new URL("./cursor-sdk-local-agent-bridge.mjs", import.meta.url));
@@ -35,6 +38,60 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(isRetryableSDKRunError({ status: 429 })).toBe(true);
     expect(isRetryableSDKRunError(new Error("Missing or invalid authorization"))).toBe(false);
     expect(isRetryableSDKRunError({ status: 401, message: "Unauthorized" })).toBe(false);
+  });
+
+  it("treats a completed-but-empty SDK run as a retryable error and evicts the wedged agent", async () => {
+    const input = {
+      apiKey: "k",
+      model: "composer-2.5",
+      workingDirectory: "/tmp",
+      sessionKey: "empty-run-session",
+      requestId: "req-empty",
+      prompt: "hello",
+      clientTools: []
+    };
+    const cacheKey = agentCacheKey(input);
+    let closed = false;
+    const fakeRun = {
+      id: "run-1",
+      // No events -> accumulated text stays "".
+      async *stream() {},
+      async wait() {
+        return { status: "completed", result: "" };
+      },
+      cancel() {
+        return Promise.resolve();
+      }
+    };
+    const fakeAgent = {
+      agentId: "agent-1",
+      async send() {
+        return fakeRun;
+      },
+      close() {
+        closed = true;
+      }
+    };
+    // Pre-seed the cache so getAgent returns this fake agent instead of calling
+    // the real Agent.create from @cursor/sdk.
+    agentCache.set(cacheKey, { agent: fakeAgent, touchedAt: 0 });
+
+    let thrown;
+    try {
+      await runLocalAgentBody(input, () => {}, undefined);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      agentCache.delete(cacheKey);
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown.code).toBe("cursor_sdk_empty");
+    expect(thrown.status).toBe(503);
+    expect(isRetryableSDKRunError(thrown)).toBe(true);
+    // evictAgent ran: cache entry removed and the wedged agent was closed.
+    expect(agentCache.has(cacheKey)).toBe(false);
+    expect(closed).toBe(true);
   });
 
   it("treats opaque SDK error results as retryable but preserves explicit auth failures", () => {

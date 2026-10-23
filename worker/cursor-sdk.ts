@@ -68,7 +68,11 @@ const SDK_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const AGENT_MODE_AGENT = 1;
 const DEFAULT_SDK_CLIENT_VERSION = "sdk-1.0.13";
 const SDK_STREAM_START_TIMEOUT_MS = 25_000;
-const DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS = 180_000;
+// composer-api's wait on the bridge. Kept slightly above the bridge's own run
+// timeout (CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, default 300s) so the bridge times
+// out first and returns its clean cursor_sdk_timeout, rather than composer-api
+// aborting the request mid-run. Override with CURSOR_SDK_BRIDGE_TIMEOUT_MS.
+const DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS = 330_000;
 const SDK_TOOL_RETRY_ATTEMPTS = 3;
 
 const TOOL_CALL_SPECS: Record<number, ToolSpec> = {
@@ -109,6 +113,7 @@ export async function createCursorSdkCompletion(
     clientTools?: ClientToolSpec[];
     requiresLocalTool?: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    streaming?: boolean;
   }
 ): Promise<CursorSdkCompletion> {
   const now = deps.now();
@@ -135,10 +140,17 @@ export async function createCursorSdkCompletion(
   };
 
   if (hasCursorSdkBridge(env)) {
+    // For a streaming response, consume the bridge's NDJSON event stream so the
+    // model's text reaches the client token-by-token (the bridge emits one
+    // `text` event per SDK delta). The buffered JSON path -- with its full
+    // no-tool-call retry -- stays for non-streaming responses, which can't
+    // surface partial output anyway.
     return {
       agentId,
       runId,
-      stream: streamCursorLocalSdkBridgeRunWithRetry(env, deps, apiKey, runInput)
+      stream: input.streaming
+        ? streamCursorLocalSdkBridgeRunStreaming(env, deps, apiKey, runInput)
+        : streamCursorLocalSdkBridgeRunWithRetry(env, deps, apiKey, runInput)
     };
   }
 
@@ -424,6 +436,228 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
   }
 
   for (const event of lastEvents) yield event;
+}
+
+interface CursorSdkBridgeStreamEvent {
+  type?: string;
+  text?: string;
+  toolCall?: unknown;
+  output?: CursorSdkBridgeOutput;
+  error?: { message?: string; code?: string };
+}
+
+// Consume the bridge's NDJSON event stream (streamEvents:true) and yield each
+// parsed event ({type:"text"|"tool_call"|"done"|"error"}). Unlike the buffered
+// JSON path this surfaces the model's text as it is generated, one event per SDK
+// delta. A start-timeout bounds only how long we wait for the FIRST event; once
+// events flow the bridge's own run timeout governs, so a long-but-active
+// generation is never cut by a composer-side total deadline.
+async function* cursorLocalSdkBridgeEvents(
+  env: Env,
+  deps: Deps,
+  apiKey: string,
+  input: {
+    agentId: string;
+    runId: string;
+    sessionKey: string;
+    prompt: string;
+    modelId: string;
+    workingDirectory?: string;
+    clientTools?: ClientToolSpec[];
+  }
+): AsyncGenerator<CursorSdkBridgeStreamEvent> {
+  const body = JSON.stringify({
+    apiKey,
+    requestId: input.runId,
+    model: input.modelId,
+    prompt: input.prompt,
+    sessionKey: input.sessionKey || input.agentId,
+    workingDirectory: sdkWorkingDirectory(input.workingDirectory),
+    tools: bridgeClientTools(input.clientTools),
+    streamEvents: true
+  });
+  const bridgeBinding = env.CURSOR_SDK_BRIDGE_CONTAINER;
+  const bridgeUrl = env.CURSOR_SDK_BRIDGE_URL?.trim();
+  const headers = cursorLocalSdkBridgeHeaders(env);
+  const controller = new AbortController();
+  let started = false;
+  const startTimer = setTimeout(() => {
+    if (!started) controller.abort();
+  }, SDK_STREAM_START_TIMEOUT_MS);
+  try {
+    const response = bridgeBinding
+      ? await bridgeBinding.get(bridgeBinding.idFromName("shared")).fetch("http://cursor-sdk-bridge.local/sdk", { method: "POST", headers, body, signal: controller.signal })
+      : bridgeUrl
+        ? await deps.fetch(bridgeUrl, { method: "POST", headers, body, signal: controller.signal })
+        : undefined;
+    if (!response) throw new HttpError("Cursor SDK bridge is not configured", 500, "cursor_sdk_bridge_missing");
+    if (!response.ok) {
+      // Error responses are a single JSON object, not NDJSON. Reuse the buffered
+      // parser, which throws a mapped HttpError for a non-2xx bridge reply.
+      await parseCursorLocalSdkBridgeJsonResponse(response);
+      return;
+    }
+    const reader = response.body?.getReader();
+    if (!reader) return;
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      started = true;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex: number;
+      while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!line) continue;
+        let event: CursorSdkBridgeStreamEvent;
+        try {
+          event = JSON.parse(line) as CursorSdkBridgeStreamEvent;
+        } catch {
+          continue;
+        }
+        yield event;
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) {
+      try {
+        yield JSON.parse(tail) as CursorSdkBridgeStreamEvent;
+      } catch {
+        // ignore a trailing partial line
+      }
+    }
+  } finally {
+    clearTimeout(startTimer);
+  }
+}
+
+// One streamed bridge run: forward text events live as they arrive, then resolve
+// the final tool call from the `done` output -- normalized and gated exactly like
+// the buffered `streamCursorLocalSdkBridgeRun` so tool behavior is unchanged.
+async function* streamBridgeRunOnce(
+  env: Env,
+  deps: Deps,
+  apiKey: string,
+  input: {
+    agentId: string;
+    runId: string;
+    sessionKey: string;
+    prompt: string;
+    modelId: string;
+    workingDirectory?: string;
+    clientTools?: ClientToolSpec[];
+    allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+  }
+): AsyncGenerator<CursorTextEvent> {
+  let streamedText = "";
+  let doneOutput: CursorSdkBridgeOutput | undefined;
+  for await (const event of cursorLocalSdkBridgeEvents(env, deps, apiKey, input)) {
+    if (event.type === "text" && typeof event.text === "string" && event.text) {
+      streamedText += event.text;
+      yield { type: "text", text: event.text };
+    } else if (event.type === "done") {
+      doneOutput = event.output;
+    } else if (event.type === "error") {
+      const message = typeof event.error?.message === "string" && event.error.message ? event.error.message : "Cursor SDK bridge stream failed";
+      const code = typeof event.error?.code === "string" && event.error.code ? event.error.code : "cursor_sdk_bridge_error";
+      throw new HttpError(message, 502, code);
+    }
+    // Bridge "tool_call" events are ignored here; the authoritative tool calls
+    // come from the done output, normalized the same way as the buffered path.
+  }
+  const finalText = typeof doneOutput?.text === "string" ? doneOutput.text : streamedText;
+  const rawToolCalls = Array.isArray(doneOutput?.toolCalls) ? doneOutput!.toolCalls! : [];
+  for (const rawToolCall of rawToolCalls) {
+    if (!rawToolCall || typeof rawToolCall.name !== "string") continue;
+    const toolCall = normalizeSdkToolCallForOpenCode({
+      name: rawToolCall.name,
+      arguments: isRecord(rawToolCall.arguments) ? rawToolCall.arguments : {}
+    });
+    if (!isEmittableSdkToolCall(toolCall)) continue;
+    const decision = input.allowToolCall?.(toolCall) ?? true;
+    if (decision !== true) {
+      yield { type: "rejected_tool_call", toolCall, reason: typeof decision === "string" ? decision : undefined };
+      yield { type: "done", finalText, toolCalls: [] };
+      return;
+    }
+    yield { type: "tool_call", toolCall };
+    yield { type: "done", finalText, toolCalls: [toolCall] };
+    return;
+  }
+  yield { type: "done", finalText, toolCalls: [] };
+}
+
+// Streaming counterpart to streamCursorLocalSdkBridgeRunWithRetry. Text streams
+// to the client as it is generated. The no-tool-call retry survives only while
+// nothing has been streamed yet: once any text byte is out we cannot re-run the
+// turn, so we commit to the current attempt (the "drop retry once bytes out"
+// tradeoff). Tool-only turns -- no text before the call -- still retry normally.
+async function* streamCursorLocalSdkBridgeRunStreaming(
+  env: Env,
+  deps: Deps,
+  apiKey: string,
+  input: {
+    agentId: string;
+    runId: string;
+    sessionKey: string;
+    prompt: string;
+    modelId: string;
+    workingDirectory?: string;
+    clientTools?: ClientToolSpec[];
+    requiresLocalTool: boolean;
+    allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+  }
+): AsyncGenerator<CursorTextEvent> {
+  if (!input.requiresLocalTool && !input.allowToolCall) {
+    yield* streamBridgeRunOnce(env, deps, apiKey, input);
+    return;
+  }
+
+  let attemptInput = input;
+  for (let attempt = 1; attempt <= SDK_TOOL_RETRY_ATTEMPTS; attempt += 1) {
+    let yieldedText = false;
+    let sawToolCall = false;
+    let rejectedEvent: Extract<CursorTextEvent, { type: "rejected_tool_call" }> | undefined;
+    let doneEvent: Extract<CursorTextEvent, { type: "done" }> | undefined;
+
+    for await (const event of streamBridgeRunOnce(env, deps, apiKey, attemptInput)) {
+      if (event.type === "text") {
+        yieldedText = true;
+        yield event;
+      } else if (event.type === "tool_call") {
+        sawToolCall = true;
+        yield event;
+      } else if (event.type === "rejected_tool_call") {
+        rejectedEvent = event;
+      } else if (event.type === "done") {
+        doneEvent = event;
+      }
+    }
+
+    if (sawToolCall) {
+      if (doneEvent) yield doneEvent;
+      return;
+    }
+
+    const rejectedToolCall = rejectedEvent?.toolCall;
+    const shouldRetry = !yieldedText && (rejectedToolCall || input.requiresLocalTool) && attempt < SDK_TOOL_RETRY_ATTEMPTS;
+    if (shouldRetry) {
+      attemptInput = {
+        ...input,
+        runId: newLocalSdkRunId(deps.randomUUID()),
+        prompt: rejectedToolCall
+          ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedEvent?.reason, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+          : retryPromptAfterMissingTool(input.prompt, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+      };
+      continue;
+    }
+
+    if (rejectedEvent) yield rejectedEvent;
+    if (doneEvent) yield doneEvent;
+    return;
+  }
 }
 
 function retryPromptAfterMissingTool(prompt: string, attempt = 2, maxAttempts = SDK_TOOL_RETRY_ATTEMPTS): string {
